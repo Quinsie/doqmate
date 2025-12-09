@@ -1,0 +1,114 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.production
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Build outputs
+build/
+.vite/
+
+# Cache
+.cache/
+.parcel-cache/
+.npm
+.eslintcache
+
+# Testing
+coverage/
+*.lcov
+.nyc_output
+test-results/
+
+# Temporary folders
+tmp/
+temp/
+
+# OS generated files
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# Deployment platforms
+.vercel
+.netlify
+.firebase/
+firebase-debug.log
+
+# PWA files
+sw.js
+workbox-*.js
+
+# Mobile app builds (Capacitor)
+android/
+ios/
+
+# API 키 및 민감한 설정
+keys/
+secrets/
+config/api-keys.json
+
+# 이미지 업로드 임시 폴더
+uploads/temp/
+temp-images/
+
+# 데이터베이스 파일 (로컬 개발용)
+*.db
+*.sqlite
+*.sqlite3
+
+# 백업 및 임시 파일
+*.backup
+*.bak
+*.draft
+
+# 성능 분석 결과
+lighthouse-reports/
+bundle-analyzer-report.html
+*.cpuprofile
+*.heapprofile
+
+# 압축 파일
+*.zip
+*.tar.gz
+*.rar
+
+# Markdown
+CLAUDE.md
+api.md

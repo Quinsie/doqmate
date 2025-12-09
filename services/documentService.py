@@ -1,0 +1,493 @@
+# services/documentService.py
+
+"""
+documentService.py
+
+functions:
+    processDocument  | PDF 1개에 대해 파싱-임베딩-인덱싱 전체 파이프라인 실행
+
+helpers:
+    _resolvePdfPath              | PDF 경로 정규화 헬퍼
+    _buildTextChunks             | T3 병합 결과를 TextChunk 리스트로 변환하는 헬퍼
+    _debugPrintFullPipeline      | 디버그용 전체 파이프라인 출력 헬퍼 (STEP1 전 단계 전부)
+    _debugPrintChunksAndVectors  | 디버그용 청크/임베딩 전체 출력 헬퍼
+    chunks_to_dicts              | TextChunk 리스트를 upsert용 dict 리스트로 변환하는 헬퍼
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import logging
+from loggerConfig import (
+    setup_root_logging,
+    setup_service_file_handlers,
+    service_log_context,
+)
+
+from typing import Any, Dict, List
+
+from services.embedding.embedding import EmbeddingError, embedTexts
+from services.llm.firstRefine import cleanOcrTextBlocks
+from services.llm.secondRefine import mergeText
+from services.parsing.extractPDF import extractPDF
+from services.parsing.maskPDF import maskPDF
+from services.parsing.runOCR import runOCR
+from services.retrieval.store import upsertChunks
+from services.retrieval.delete import deleteChunksByDocument
+from services.schemas.embeddingSchemas import TextChunk
+from services.schemas.pdfSchemas import (
+    MaskedPage,
+    MergedTextBlock,
+    PDFExtractionResult,
+    TextBlock,
+)
+
+logger = logging.getLogger(__name__)
+
+_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+def chunks_to_dicts(chunks: list[TextChunk]) -> list[dict[str, Any]]:
+    """
+    helper: chunks_to_dicts
+    TextChunk 리스트를 VectorStore upsert용 dict 리스트로 변환.
+    """
+    return [
+        {
+            "chunk_id": c.chunk_id,
+            "text": c.text,
+            "meta": c.meta,
+        }
+        for c in chunks
+    ]
+
+
+def _resolvePdfPath(pdfPath: str) -> str:
+    """
+    helper: _resolvePdfPath
+    입력:
+        pdfPath : 상대/절대 PDF 경로
+    출력:
+        absPath : 절대 경로
+
+    프로젝트 루트 기준 상대 경로가 들어오는 경우를 고려해 절대 경로로 정규화.
+    """
+    if os.path.isabs(pdfPath):
+        absPath = pdfPath
+    else:
+        absPath = os.path.join(_ROOT_DIR, pdfPath)
+
+    if not os.path.isfile(absPath):
+        logger.error("PDF 파일을 찾을 수 없습니다: %s", absPath)
+        raise FileNotFoundError(f"PDF not found: {absPath}")
+
+    return absPath
+
+
+def _buildTextChunks(
+    mergedPages: dict[int, list[MergedTextBlock]],
+    *,
+    extraction: PDFExtractionResult,         # 이미지 정보를 쓰기 위해 추가
+    chatbotId: str,
+    documentId: str,
+    filename: str | None,
+    userGroupTags: list[str] | None,
+    maxChars: int = 800,
+    overlap: int = 200,
+) -> list[TextChunk]:
+    """
+    helper: _buildTextChunks
+    입력:
+        mergedPages   : page -> [MergedTextBlock...] (Task 3 결과)
+        extraction    : PDFExtractionResult (텍스트 + 이미지 정보 전체)
+        chatbotId     : 논리적 챗봇 ID
+        documentId    : 논리적 문서 ID
+        filename      : 원본 파일명 (없으면 None)
+        userGroupTags : 권한/태깅용 사용자 그룹 태그 리스트 (없으면 ["default"])
+        maxChars      : 청크 최대 문자 수
+        overlap       : 청크 간 중첩 문자 수
+    출력:
+        chunks        : TextChunk 리스트
+
+    변경점:
+        - 페이지 단위가 아니라 문서 전체 흐름 기준 글로벌 순번(order_index)을 부여.
+        - meta["image_paths"] 에 해당 페이지의 이미지 경로 리스트를 추가.
+    """
+    chunks: list[TextChunk] = []
+    groupTags = userGroupTags if userGroupTags is not None else ["default"]
+
+    # page -> [image_path, ...] 매핑
+    page_to_image_paths: Dict[int, List[str]] = {}
+    try:
+        for ib in extraction.image_blocks:
+            # image_path 가 None 인 것도 있을 수 있으니 방어
+            if ib.image_path:
+                page_to_image_paths.setdefault(ib.page, []).append(ib.image_path)
+    except Exception as e:
+        logger.exception("[CHUNK] image_blocks 처리 중 오류 발생: %s", e)
+
+    # 문서 전체 기준 글로벌 순번
+    globalOrderIndex = 0
+
+    for page in sorted(mergedPages.keys()):
+        blocks = mergedPages[page]
+        if not blocks:
+            continue
+
+        # 이 페이지에 포함된 모든 src_block_ids 합집합 (디버깅/추적용)
+        page_src_ids: set[str] = set()
+        for mb in blocks:
+            for sid in mb.src_block_ids:
+                page_src_ids.add(sid)
+
+        # 페이지 텍스트 구성
+        pageTextParts: list[str] = []
+        for mb in blocks:
+            text = (mb.text or "").strip()
+            if text:
+                pageTextParts.append(text)
+        pageText = "\n".join(pageTextParts).strip()
+
+        if not pageText:
+            continue
+
+        start = 0
+        length = len(pageText)
+
+        # 페이지 내부 순번
+        pageChunkOrder = 0
+
+        # 이 페이지에 연결된 이미지 경로(없으면 빈 리스트)
+        image_paths_for_page = page_to_image_paths.get(page, [])
+
+        while start < length:
+            end = min(start + maxChars, length)
+            chunkText = pageText[start:end].strip()
+            if not chunkText:
+                break
+
+            chunkId = f"{documentId}_p{page}_c{pageChunkOrder}"
+
+            meta: dict[str, Any] = {
+                "filename": filename,
+                "page": page,
+                "document_id": documentId,
+                "chatbot_id": chatbotId,
+                "user_group_tags": groupTags,
+                "process_tag": "body",
+                # 순번 관련 필드들
+                "page_chunk_order": pageChunkOrder,   # 페이지 내부 순번
+                "order_index": globalOrderIndex,      # 문서 전체 기준 순번
+                "chunk_order": globalOrderIndex,      # (구 버전 호환용 alias)
+                # 이 청크가 포함하는 원본 블록들의 집합
+                "src_block_ids": sorted(page_src_ids),
+            }
+
+            # 페이지 기준 이미지 경로를 meta에 추가
+            if image_paths_for_page:
+                meta["image_paths"] = image_paths_for_page
+
+            chunks.append(
+                TextChunk(
+                    chunk_id=chunkId,
+                    text=chunkText,
+                    page=page,
+                    # 이제 order는 문서 전체 기준 글로벌 순번
+                    order=globalOrderIndex,
+                    meta=meta,
+                )
+            )
+
+            # 청크 하나 만들 때마다 글로벌 순번 증가
+            globalOrderIndex += 1
+
+            if end >= length:
+                break
+
+            start = end - overlap
+            pageChunkOrder += 1
+
+    logger.info("[CHUNK] 본문 청크 생성 완료: chunks=%d", len(chunks))
+    return chunks
+
+
+def _debugPrintFullPipeline(
+    extraction: PDFExtractionResult,
+    maskedPages: list[MaskedPage],
+    ocrBlocksRaw: list[TextBlock],
+    ocrBlocksCleaned: list[TextBlock],
+    mergedPages: dict[int, list[MergedTextBlock]],
+) -> None:
+    """
+    helper: _debugPrintFullPipeline
+    (생략: 내용 기존과 동일)
+    """
+    numTextBlocks = len(extraction.text_blocks)
+    numImageBlocks = len(extraction.image_blocks)
+    numMaskedPages = len(maskedPages)
+    numOcrRaw = len(ocrBlocksRaw)
+    numOcrClean = len(ocrBlocksCleaned)
+    numMergedBlocks = sum(len(v) for v in mergedPages.values())
+
+    print("\n=== [DEBUG] DOCUMENT PIPELINE SUMMARY (FULL OUTPUT) ===")
+    print(f"- PyMuPDF text blocks            : {numTextBlocks}")
+    print(f"- PyMuPDF image blocks           : {numImageBlocks}")
+    print(f"- Masked pages                   : {numMaskedPages}")
+    print(f"- OCR text blocks (raw)          : {numOcrRaw}")
+    print(f"- OCR text blocks (cleaned, T0)  : {numOcrClean}")
+    print(f"- Merged text blocks (T3)        : {numMergedBlocks}")
+
+    # ... 나머지 debug print 부분은 기존 코드 그대로 ...
+
+
+def _debugPrintChunksAndVectors(
+    chunks: list[TextChunk],
+    embeddings: list[list[float]],
+) -> None:
+    """
+    helper: _debugPrintChunksAndVectors
+    (내용 기존과 동일)
+    """
+    print("\n[DEBUG] [TEXT CHUNKS - FULL]")
+    print(f"[DEBUG] total_chunks={len(chunks)}")
+
+    for idx, ch in enumerate(chunks):
+        print(f"\n  [DEBUG] chunk_index={idx}")
+        print(f"    chunk_id  : {ch.chunk_id}")
+        print(f"    page      : {ch.page}")
+        print(f"    order     : {ch.order}")
+        print(f"    meta      : {ch.meta}")
+        print(f"    text      : {ch.text!r}")
+
+    print("\n[DEBUG] [EMBEDDINGS - FULL]")
+    print(f"[DEBUG] total_embeddings={len(embeddings)}")
+
+    # for idx, vec in enumerate(embeddings):
+    #     dim = len(vec)
+    #     print(f"\n  [DEBUG] emb_index={idx} dim={dim}")
+    #     print(f"    vector={vec}")
+
+
+def processDocument(
+    chatbotId: str,
+    documentId: str,
+    pdfPath: str,
+    *,
+    filename: str | None = None,
+    userGroupTags: list[str] | None = None,
+    maxChars: int = 800,
+    overlap: int = 200,
+    debug: bool = True,
+) -> dict[str, Any]:
+    """
+    function: processDocument
+    (docstring 생략, 기존과 동일)
+    """
+
+    setup_root_logging()
+    setup_service_file_handlers()
+
+    with service_log_context("documentService"):
+        logger.info(
+            "processDocument 시작: chatbot_id=%s document_id=%s pdf_path=%s",
+            chatbotId,
+            documentId,
+            pdfPath,
+        )
+
+        absPdfPath = _resolvePdfPath(pdfPath)
+
+        # PyMuPDF 기반 텍스트/이미지 블록 추출 (documentId 기준으로 이미지 디렉토리 분리)
+        extraction = extractPDF(absPdfPath, documentId=documentId)
+
+        # 텍스트/이미지 영역 마스킹 + OCR용 이진화 이미지 생성
+        maskedPages = maskPDF(absPdfPath, extraction)
+
+        # EasyOCR 수행 및 OCR TextBlock 리스트 생성 (bbox는 PDF 좌표계 기준)
+        ocrBlocksRaw = runOCR(maskedPages)
+
+        # OCR 1차 정제 (Task 0)
+        ocrBlocksCleaned = cleanOcrTextBlocks(ocrBlocksRaw)
+
+        # PyMuPDF + OCR 2차 정제/병합 (Task 3)
+        mergedPages = mergeText(
+            extraction=extraction,
+            ocrBlocks=ocrBlocksCleaned,
+            chatbotId=chatbotId,
+            documentId=documentId,
+        )
+
+        logger.info(
+            "processDocument T3까지 완료: chatbot_id=%s document_id=%s text_blocks=%d "
+            "image_blocks=%d masked_pages=%d ocr_raw=%d ocr_clean=%d merged_pages=%d merged_blocks=%d",
+            chatbotId,
+            documentId,
+            len(extraction.text_blocks),
+            len(extraction.image_blocks),
+            len(maskedPages),
+            len(ocrBlocksRaw),
+            len(ocrBlocksCleaned),
+            len(mergedPages),
+            sum(len(v) for v in mergedPages.values()),
+        )
+
+        # T3 -> TextChunk 청킹 (이제 extraction도 함께 전달)
+        chunks = _buildTextChunks(
+            mergedPages,
+            extraction=extraction,
+            chatbotId=chatbotId,
+            documentId=documentId,
+            filename=filename,
+            userGroupTags=userGroupTags,
+            maxChars=maxChars,
+            overlap=overlap,
+        )
+
+        # TextChunk 텍스트 -> 임베딩
+        texts = [ch.text for ch in chunks]
+        try:
+            embeddings = embedTexts(texts)
+        except EmbeddingError as e:
+            logger.exception(
+                "임베딩 처리 중 오류 발생: chatbot_id=%s document_id=%s error=%s",
+                chatbotId,
+                documentId,
+                e,
+            )
+            raise
+
+        if len(embeddings) != len(chunks):
+            raise RuntimeError(
+                f"임베딩 개수({len(embeddings)})와 청크 개수({len(chunks)})가 다릅니다."
+            )
+
+        logger.info(
+            "[EMBED] 임베딩 생성 완료: chatbot_id=%s document_id=%s chunks=%d dim=%s",
+            chatbotId,
+            documentId,
+            len(chunks),
+            len(embeddings[0]) if embeddings else "N/A",
+        )
+
+        # VectorDB upsert
+        chunkDicts = chunks_to_dicts(chunks)
+
+        upsertCount = upsertChunks(
+            chatbotId=chatbotId,
+            documentId=documentId,
+            chunks=chunkDicts,
+            embeddings=embeddings,
+        )
+
+        logger.info(
+            "[INDEX] upsertChunks 완료: chatbot_id=%s document_id=%s upsert_count=%d",
+            chatbotId,
+            documentId,
+            upsertCount,
+        )
+
+        # DEBUG 출력
+        if debug:
+            _debugPrintFullPipeline(
+                extraction=extraction,
+                maskedPages=maskedPages,
+                ocrBlocksRaw=ocrBlocksRaw,
+                ocrBlocksCleaned=ocrBlocksCleaned,
+                mergedPages=mergedPages,
+            )
+            _debugPrintChunksAndVectors(
+                chunks=chunks,
+                embeddings=embeddings,
+            )
+
+        result: dict[str, Any] = {
+            "extraction": extraction,
+            "masked_pages": maskedPages,
+            "ocr_raw": ocrBlocksRaw,
+            "ocr_clean": ocrBlocksCleaned,
+            "merged_pages": mergedPages,
+            "chunks": chunks,
+            "embeddings": embeddings,
+            "upsert_count": upsertCount,
+        }
+
+        return result
+
+def deleteDocument(
+    chatbotId: str,
+    documentId: str,
+) -> None:
+    """
+    function: deleteDocument
+    입력:
+        chatbotId  : 논리적 챗봇 ID
+        documentId : 논리적 문서 ID
+    출력:
+        없음
+
+    VectorStore에서 해당 문서의 모든 청크/임베딩 삭제.
+    """
+    setup_root_logging()
+    setup_service_file_handlers()
+
+    with service_log_context("documentService"):
+        logger.info(
+            "deleteDocument 시작: chatbot_id=%s document_id=%s",
+            chatbotId,
+            documentId,
+        )
+
+        deleteChunksByDocument(
+            chatbotId=chatbotId,
+            documentId=documentId,
+        )
+
+        logger.info(
+            "deleteDocument 완료: chatbot_id=%s document_id=%s",
+            chatbotId,
+            documentId,
+        )
+
+if __name__ == "__main__":
+    # 테스트/디버그용 엔트리 포인트 (기존과 동일)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    )
+
+    pdfArg = None
+    chatbotId = "test_chatbot"
+    documentId = "test_document"
+    filename = None
+    userGroupTags: list[str] | None = None
+
+    if len(sys.argv) >= 2:
+        pdfArg = sys.argv[1]
+    else:
+        pdfArg = os.path.join("data", "PDF", "test2.pdf")
+
+    if len(sys.argv) >= 3:
+        chatbotId = sys.argv[2]
+    if len(sys.argv) >= 4:
+        documentId = sys.argv[3]
+    if len(sys.argv) >= 5:
+        filename = sys.argv[4]
+    if len(sys.argv) >= 6:
+        userGroupTags = [
+            t.strip() for t in sys.argv[5].split(",") if t.strip()
+        ]
+
+    try:
+        _ = processDocument(
+            chatbotId=chatbotId,
+            documentId=documentId,
+            pdfPath=pdfArg,
+            filename=filename,
+            userGroupTags=userGroupTags,
+            debug=True,
+        )
+    except Exception as e:
+        logger.exception("documentService 테스트 실행 중 예외 발생: error=%s", e)
+        print(f"[ERROR] documentService 실행 중 오류: {e}")
+        sys.exit(1)
